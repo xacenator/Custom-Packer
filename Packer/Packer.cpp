@@ -1,4 +1,5 @@
 // src/Packer.cpp
+
 #include "Packer.h"
 #include "Crypto.h"
 #include "VMDetect.h"
@@ -9,64 +10,105 @@
 #include <LIEF/PE.hpp>
 #include <stdexcept>
 #include <vector>
+#include <limits>
+#include <cstdint>
 
-using namespace LIEF::PE;  // brings in Section, PE_SECTION_TYPES, etc.
+using namespace LIEF::PE;
 
 struct Packer::Impl {
     std::unique_ptr<Binary> bin;
-    std::vector<uint8_t>     key, iv;
-    uint32_t                 originalEP;
+    std::vector<uint8_t>    key, iv;
+    uint32_t                originalEP;
+    uint64_t                imageBase;
 };
 
 Packer::Packer() : p(new Impl()) {
+    // Initialize key/IV
     p->key.assign(16, 0xAA);
     p->iv.assign(16, 0xBB);
+
+    // Initialize EP and base to zero
+    p->originalEP = 0;
+    p->imageBase = 0;
 }
 
 void Packer::Pack(const std::wstring& inPath, const std::wstring& outPath) {
-    // 1) Parse input PE
+    // 1) Load and parse the input PE
     std::string inp = Util::WStringToString(inPath);
-    p->bin = Parser::parse(inp);  // Parser::parse returns unique_ptr<Binary> :contentReference[oaicite:0]{index=0}
-    if (!p->bin) throw std::runtime_error("Failed to parse PE");
+    p->bin = Parser::parse(inp);
+    if (!p->bin) {
+        throw std::runtime_error("Failed to parse PE");
+    }
 
+    // 2) Disable ASLR: clear the DYNAMIC_BASE flag (0x0040)
+    {
+        uint16_t dllChars = p->bin->optional_header().dll_characteristics();
+        dllChars &= ~static_cast<uint16_t>(0x0040);
+        p->bin->optional_header().dll_characteristics(dllChars);
+    }
+
+    // 3) Record the Original Entry Point (RVA) and Preferred Image Base
     p->originalEP = p->bin->optional_header().addressof_entrypoint();
+    p->imageBase = p->bin->optional_header().imagebase();
 
-    // 2) Anti-VM and Anti-Debug
-    if (VMDetect::IsRunningInVM())       throw std::runtime_error("VM detected");  // uses CPUID hypervisor bit :contentReference[oaicite:1]{index=1}
-    AntiDebug::InstallAntiDebugMeasures();                                // exits on IsDebuggerPresent() :contentReference[oaicite:2]{index=2}
+    // 4) Anti-VM & Anti-Debug
+    if (VMDetect::IsRunningInVM()) {
+        throw std::runtime_error("VM detected");
+    }
+    AntiDebug::InstallAntiDebugMeasures();
 
+    // 5) Encrypt key sections: .text, .rdata, .data
     for (auto const& name : { ".text", ".rdata", ".data" }) {
         if (Section* s = p->bin->get_section(name)) {
-            auto payload = s->content();                                 // span<const uint8_t>
-            std::vector<uint8_t> data(payload.begin(), payload.end());   // now a vector
+            // copy existing bytes
+            auto span_data = s->content();
+            std::vector<uint8_t> raw(span_data.begin(), span_data.end());
 
-            auto enc = Crypto::AES_CBC_Encrypt(data, p->key, p->iv);
-            s->content(enc);                                             // setter accepts vector
+            // encrypt
+            auto enc = Crypto::AES_CBC_Encrypt(raw, p->key, p->iv);
+            if (enc.size() > std::numeric_limits<uint32_t>::max()) {
+                throw std::runtime_error("Encrypted data too large for 32-bit size");
+            }
 
+            // write back and resize
+            s->content(enc);
+            s->size(static_cast<uint32_t>(enc.size()));          // SizeOfRawData
+            s->virtual_size(static_cast<uint32_t>(enc.size()));  // VirtualSize
+
+            // allow runtime write for stub decrypt
             s->add_characteristic(Section::CHARACTERISTICS::MEM_WRITE);
         }
     }
 
-    // 4) Placeholder virtualization
+    // 6) (noop) Virtualizer placeholder
     Virtualizer::VirtualizeSections(p->bin.get());
 
-    // 5) Inject loader stub
-    std::vector<uint8_t> stub = Virtualizer::GetLoaderStub(
-        p->key, p->iv, p->originalEP
-    );
+    // 7) Inject a minimal jump-stub that jumps to (ImageBase + OriginalEP)
+    {
+        uint64_t targetVA = p->imageBase + p->originalEP;
+        std::vector<uint8_t> stub;
 
-    // Build a new Section object
-    Section new_stub(".stub");
-    new_stub.content(stub);                                           // fill with your shellcode
-    new_stub.add_characteristic(Section::CHARACTERISTICS::MEM_READ);  // set READ
-    new_stub.add_characteristic(Section::CHARACTERISTICS::MEM_EXECUTE); // set EXECUTE
+        // mov rax, imm64
+        stub.push_back(0x48);
+        stub.push_back(0xB8);
+        for (int i = 0; i < 8; ++i) {
+            stub.push_back(static_cast<uint8_t>((targetVA >> (8 * i)) & 0xFF));
+        }
+        // jmp rax
+        stub.push_back(0xFF);
+        stub.push_back(0xE0);
 
-    // Add it as a TEXT-type section and redirect EntryPoint
-    p->bin->add_section(new_stub, PE_SECTION_TYPES::TEXT);           // correct factory method :contentReference[oaicite:5]{index=5}
-    p->bin->optional_header().addressof_entrypoint(new_stub.virtual_address());
+        Section js(".stub");
+        js.content(stub);
+        js.add_characteristic(Section::CHARACTERISTICS::MEM_READ);
+        js.add_characteristic(Section::CHARACTERISTICS::MEM_EXECUTE);
 
-    // 6) Build & write out  
+        p->bin->add_section(js, PE_SECTION_TYPES::TEXT);
+        p->bin->optional_header().addressof_entrypoint(js.virtual_address());
+    }
+
+    // 8) Build and write the protected EXE
     Builder builder{ *p->bin };
     builder.build();
-    builder.write(Util::WStringToString(outPath));                   // two-step build/write API :contentReference[oaicite:6]{index=6}
+    builder.write(Util::WStringToString(outPath));
 }
