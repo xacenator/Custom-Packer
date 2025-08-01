@@ -5,7 +5,7 @@ Take a look at the differences in IDAs likew Ghidra and IdaPro. You will see Con
 
 Designed to make reversing your .exe harder against malicious attempts. 
 
-Open Source, Feel free to edit and use. I have used Chat GPT for this as well, so keep in mind that there will be error. 
+Open Source, Feel free to edit and use. I have used Chat GPT and copilot for assistance as well, so keep in mind that there will be error. 
 
 Not finished yet. There are some issues with the Memory Relocation of the newly created executable that I am currently fixing. 
 
